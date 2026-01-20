@@ -1,0 +1,46 @@
+# =========================
+# PlatformIO
+# =========================
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# PlatformIO cache
+.pio/build/
+
+# =========================
+# VS Code
+# =========================
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+
+# =========================
+# C/C++ build artifacts
+# =========================
+*.o
+*.a
+*.elf
+*.bin
+*.hex
+*.map
+
+# =========================
+# Logs & temp files
+# =========================
+*.log
+*.tmp
+
+# =========================
+# OS generated files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Environment files
+# =========================
+.env
+.env.*
