@@ -26,7 +26,7 @@ struct CommandPacket {
 };
 
 struct FeedbackPacket {
-    int32_t tick1;
+    int32_t tick1; //delta ticks
     int32_t tick2;
     int32_t tick3;
     int16_t gyro_z;

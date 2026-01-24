@@ -32,9 +32,16 @@
 
 Adafruit_MPU6050 mpu;
 bool imuReady = false;
-int16_t lastGoodGyroZ = 0;   // Cache last good IMU values
-int16_t lastGoodAccelZ = 981; // Default ~9.81 m/s² * 100
-uint8_t imuErrorCount = 0;    // Track consecutive errors
+int16_t lastGoodGyroZ = 0;
+int16_t lastGoodAccelZ = 981;
+uint8_t imuErrorCount = 0;
+
+// === COMPLEMENTARY FILTER STATE ===
+float filteredAngleX = 0.0;
+float filteredAngleY = 0.0;
+float filteredGyroZ = 0.0;
+const float FILTER_ALPHA = 0.95;  //Complementary filter constant (0.95)
+unsigned long lastFilterTime = 0;
 
 ESP32Encoder encoder1;
 ESP32Encoder encoder2;
@@ -42,9 +49,9 @@ ESP32Encoder encoder3;
 
 // === PHASE 2: BINARY PROTOCOL ===
 SerialProtocol protocol(&Serial);
-bool binaryMode = true;  // Start in binary mode for Raspi communication
+bool binaryMode = true; 
 unsigned long lastFeedbackTime = 0;
-const int FEEDBACK_INTERVAL = 50;
+const int FEEDBACK_INTERVAL = 20;
 
 // === DIRECTION CONFIG ===
 const bool INVERT_ENC1 = true;
@@ -55,9 +62,10 @@ const bool INVERT_PWM2 = false;
 const bool INVERT_PWM3 = false;
 
 // === PID (Feedforward + Trim architecture) ===
-PIDController pid1(0.3, 0.05, 0.005);
-PIDController pid2(0.3, 0.05, 0.005);
-PIDController pid3(0.3, 0.05, 0.005);
+// untuk Ki di half dari matlab karena ada feedforward
+PIDController pid1(0.40, 4.60, 0);
+PIDController pid2(0.40, 4.60, 0);
+PIDController pid3(0.40, 4.60, 0);
 
 // === CONSTANTS ===
 const int TICKS_PER_REV = 380;
@@ -71,12 +79,13 @@ const float FF_DEADBAND = 3.0;
 
 // === TIMING ===
 const int PID_INTERVAL = 20;
-const int RPM_INTERVAL = 50;
+const int RPM_INTERVAL = 20;  // SYNCHRONIZED with PID for consistent derivative calculation
+const int IMU_INTERVAL = 20;   // Separate IMU sampling rate
 const int PRINT_INTERVAL = 200;
 
 // === RATE LIMITER (prevents PWM jerk) ===
 int lastPWM1 = 0, lastPWM2 = 0, lastPWM3 = 0;
-const int PWM_RATE_LIMIT = 8;
+const int PWM_RATE_LIMIT = 5;
 
 // === RAMP SYSTEM ===
 const float RAMP_UP_RATE = 5.0;
@@ -92,10 +101,13 @@ float rawRPM1 = 0, rawRPM2 = 0, rawRPM3 = 0;
 float currentRPM1 = 0, currentRPM2 = 0, currentRPM3 = 0;
 long prevTicks1 = 0, prevTicks2 = 0, prevTicks3 = 0;
 unsigned long prevMicros = 0;
-unsigned long lastPIDTime = 0, lastRPMTime = 0, lastPrintTime = 0;
+unsigned long lastPIDTime = 0, lastRPMTime = 0, lastPrintTime = 0, lastIMUTime = 0;
 bool testModeActive = false;
 unsigned long testModeStartTime = 0;
 const unsigned long TEST_DURATION = 5000;
+
+// Delta ticks
+long lastSentTicks1 = 0,lastSentTicks2 = 0,lastSentTicks3 = 0;
 
 // === FUNCTION DECLARATIONS ===
 void parseAndDrive(String data);
@@ -113,9 +125,11 @@ float applyDeadZone(float rpm);
 void sendFeedbackPacket();
 void handleBinaryProtocol();
 void handleDebugMode();
+void updateIMU();
 
 void setup() {
     Serial.begin(115200);
+    Serial.setRxBufferSize(512);  // Prevent buffer overflow on burst transmission
     Serial.setTimeout(10);
 
     protocol.setMotorStopCallback(forceStopMotors);
@@ -155,36 +169,39 @@ void setup() {
 
     // === IMU SETUP (with timeout to prevent blocking) ===
     Wire.begin(SDA, SCL);
-    Wire.setClock(100000);  // 100kHz I2C (slower = more stable)
-    Wire.setTimeOut(50);    // 50ms I2C timeout
+    Wire.setClock(400000);  // 100kHz I2C (slower = more stable)
     
-    // Try to init MPU6050 with timeout protection
-    unsigned long imuStartTime = millis();
-    while (millis() - imuStartTime < 500) {  // Max 500ms untuk init
-        if (mpu.begin(0x68, &Wire)) {
-            imuReady = true;
-            mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-            mpu.setGyroRange(MPU6050_RANGE_2000_DEG);
-            mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-            break;
-        }
-        delay(50);
+    if (!mpu.begin(0x68, &Wire)) {
+        imuReady = false;
+    } else {
+        imuReady = true;
+
+        mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+        mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+        mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+        delay(100);
     }
 
     // Binary mode: NO text output (akan corrupt binary stream)
-    // Untuk debug, ketik 'd' di Serial Monitor untuk switch ke debug mode
-    
+    // Untuk debug, ketik 'd' di Serial Monitor untuk switch ke debug mod
     // Only print welcome if NOT in binary mode
     if (!binaryMode) {
         Serial.println();
-        Serial.println("=== ESP32 MOTOR CONTROLLER (Phase 2) ===");
+        Serial.println("=== ESP32 MOTOR CONTROLLER ===");
         Serial.print("IMU Status: ");
         Serial.println(imuReady ? "READY" : "NOT READY");
-        Serial.println("Commands: r=reset, s=stop, w=test300, 1/2/3=openloop, b=binary, i=imu");
+        Serial.println("Mode: Debug (ketik 'b' untuk binary mode)");
     }
 }
 
 void loop() {
+    static unsigned long lastModeBlink = 0;
+    if (millis() - lastModeBlink > (binaryMode ? 1000 : 200)) {
+        digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+        lastModeBlink = millis();
+    }
+
     if (binaryMode) {
         handleBinaryProtocol();
     } else {
@@ -206,6 +223,11 @@ void loop() {
             updatePID();
         }
         lastPIDTime = millis();
+    }
+
+    if (millis() - lastIMUTime >= IMU_INTERVAL){
+        updateIMU();
+        lastIMUTime = millis();
     }
 
     if (binaryMode && millis() - lastFeedbackTime >= FEEDBACK_INTERVAL) {
@@ -230,7 +252,7 @@ void handleBinaryProtocol() {
             binaryMode = false;
             forceStopMotors();
             Serial.println(">>> DEBUG MODE <<<");
-            Serial.println("Commands: r=reset, s=stop, w=test300, 1/2/3=openloop, b=binary, i=imu");
+            Serial.println("Commands: w=test, r=reset, s=stop, b=binary");
             return;
         }
         break;  // Not a mode switch, let parseCommand handle it
@@ -259,37 +281,50 @@ void handleBinaryProtocol() {
 
 void sendFeedbackPacket() {
     FeedbackPacket feedback;
+
+    long currentTicks1 = INVERT_ENC1 ? -encoder1.getCount() : encoder1.getCount();
+    long currentTicks2 = INVERT_ENC2 ? -encoder2.getCount() : encoder2.getCount();
+    long currentTicks3 = INVERT_ENC3 ? -encoder3.getCount() : encoder3.getCount();
+
+    feedback.tick1 = currentTicks1 - lastSentTicks1;
+    feedback.tick2 = currentTicks2 - lastSentTicks2;
+    feedback.tick3 = currentTicks3 - lastSentTicks3;
     
-    feedback.tick1 = INVERT_ENC1 ? -encoder1.getCount() : encoder1.getCount();
-    feedback.tick2 = INVERT_ENC2 ? -encoder2.getCount() : encoder2.getCount();
-    feedback.tick3 = INVERT_ENC3 ? -encoder3.getCount() : encoder3.getCount();
-    
-    // Read IMU data with robust error handling
-    if (imuReady) {
-        sensors_event_t a, g, temp;
-        if (mpu.getEvent(&a, &g, &temp)) {
-            lastGoodGyroZ = (int16_t)(g.gyro.z * 1000);
-            lastGoodAccelZ = (int16_t)(a.acceleration.z * 100);
-            imuErrorCount = 0;
-        } else {
-            imuErrorCount++;
-            if (imuErrorCount == 10) {
-                Wire.end();
-                delay(10);
-                Wire.begin(SDA, SCL);
-                Wire.setClock(100000);
-                Wire.setTimeOut(50);
-            }
-        }
-        
-        feedback.gyro_z = lastGoodGyroZ;
-        feedback.accel_z = lastGoodAccelZ;
-    } else {
-        feedback.gyro_z = lastGoodGyroZ;
-        feedback.accel_z = lastGoodAccelZ;
-    }
+    lastSentTicks1 = currentTicks1;
+    lastSentTicks2 = currentTicks2;
+    lastSentTicks3 = currentTicks3;
+
+    feedback.gyro_z = lastGoodGyroZ;
+    feedback.accel_z = lastGoodAccelZ;
     
     protocol.sendFeedback(feedback);
+}
+
+void updateIMU() {
+    if(!imuReady){
+        return;
+    }
+
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+
+    unsigned long currentTime = micros();
+    float dt = (lastFilterTime == 0) ? 0.02 : (currentTime - lastFilterTime) / 1000000.0;
+    lastFilterTime = currentTime;
+
+    if(dt < 0.001 || dt > 0.1) {
+        dt = 0.02;
+    }
+
+    float accelAngleX = atan2(a.acceleration.y, sqrt(a.acceleration.x * a.acceleration.x + a.acceleration.z * a.acceleration.z));
+    float accelAngleY = atan2(-a.acceleration.x, sqrt(a.acceleration.y * a.acceleration.y + a.acceleration.z * a.acceleration.z));
+
+    filteredAngleX = FILTER_ALPHA * (filteredAngleX + g.gyro.x * dt) + (1.0 - FILTER_ALPHA) * accelAngleX;
+    filteredAngleY = FILTER_ALPHA * (filteredAngleY + g.gyro.y * dt) + (1.0 - FILTER_ALPHA) * accelAngleY;
+    filteredGyroZ = FILTER_ALPHA * filteredGyroZ + (1.0 - FILTER_ALPHA) * g.gyro.z;
+
+    lastGoodGyroZ = (int16_t)(filteredGyroZ * 1000);
+    lastGoodAccelZ = (int16_t)(filteredAngleX * 1000);
 }
 
 void handleDebugMode() {
@@ -316,17 +351,7 @@ void handleDebugMode() {
         else if (data == "d" || data == "D") {
             binaryMode = false;
             Serial.println(">>> DEBUG MODE <<<");
-            Serial.println("Commands: r=reset, s=stop, w=test300, 1/2/3=openloop, b=binary, i=imu");
-        }
-        else if (data == "i" || data == "I") {
-            Serial.print("IMU Status: ");
-            Serial.println(imuReady ? "READY" : "NOT READY");
-            if (imuReady) {
-                sensors_event_t a, g, temp;
-                mpu.getEvent(&a, &g, &temp);
-                Serial.print("Gyro Z: "); Serial.print(g.gyro.z, 4); Serial.println(" rad/s");
-                Serial.print("Accel Z: "); Serial.print(a.acceleration.z, 2); Serial.println(" m/s^2");
-            }
+            Serial.println("Commands: w=test, r=reset, s=stop, b=binary");
         }
         else if (data == "r" || data == "R") {
             encoder1.clearCount(); encoder2.clearCount(); encoder3.clearCount();
@@ -346,45 +371,6 @@ void handleDebugMode() {
             testModeActive = true;
             testModeStartTime = millis();
             Serial.println(">>> TEST 300 RPM <<<");
-        }
-        else if (data == "1") {
-            forceStopMotors();
-            encoder1.clearCount(); encoder2.clearCount(); encoder3.clearCount();
-            prevTicks1 = prevTicks2 = prevTicks3 = 0;
-            prevMicros = 0;
-            Serial.println(">>> M1 OPEN LOOP (PWM=80) <<<");
-            analogWrite(M1_RPWM, 80); analogWrite(M1_LPWM, 0);
-            delay(1500);
-            Serial.print("ENC: "); Serial.print(encoder1.getCount());
-            Serial.print(","); Serial.print(encoder2.getCount());
-            Serial.print(","); Serial.println(encoder3.getCount());
-            forceStopMotors();
-        }
-        else if (data == "2") {
-            forceStopMotors();
-            encoder1.clearCount(); encoder2.clearCount(); encoder3.clearCount();
-            prevTicks1 = prevTicks2 = prevTicks3 = 0;
-            prevMicros = 0;
-            Serial.println(">>> M2 OPEN LOOP (PWM=80) <<<");
-            analogWrite(M2_RPWM, 80); analogWrite(M2_LPWM, 0);
-            delay(1500);
-            Serial.print("ENC: "); Serial.print(encoder1.getCount());
-            Serial.print(","); Serial.print(encoder2.getCount());
-            Serial.print(","); Serial.println(encoder3.getCount());
-            forceStopMotors();
-        }
-        else if (data == "3") {
-            forceStopMotors();
-            encoder1.clearCount(); encoder2.clearCount(); encoder3.clearCount();
-            prevTicks1 = prevTicks2 = prevTicks3 = 0;
-            prevMicros = 0;
-            Serial.println(">>> M3 OPEN LOOP (PWM=80) <<<");
-            analogWrite(M3_RPWM, 80); analogWrite(M3_LPWM, 0);
-            delay(1500);
-            Serial.print("ENC: "); Serial.print(encoder1.getCount());
-            Serial.print(","); Serial.print(encoder2.getCount());
-            Serial.print(","); Serial.println(encoder3.getCount());
-            forceStopMotors();
         }
         else if (data.length() > 0) {
             parseAndDrive(data);
