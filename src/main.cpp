@@ -49,7 +49,6 @@ ESP32Encoder encoder3;
 
 // === PHASE 2: BINARY PROTOCOL ===
 SerialProtocol protocol(&Serial);
-bool binaryMode = true; 
 unsigned long lastFeedbackTime = 0;
 const int FEEDBACK_INTERVAL = 20;
 
@@ -101,30 +100,23 @@ float rawRPM1 = 0, rawRPM2 = 0, rawRPM3 = 0;
 float currentRPM1 = 0, currentRPM2 = 0, currentRPM3 = 0;
 long prevTicks1 = 0, prevTicks2 = 0, prevTicks3 = 0;
 unsigned long prevMicros = 0;
-unsigned long lastPIDTime = 0, lastRPMTime = 0, lastPrintTime = 0, lastIMUTime = 0;
-bool testModeActive = false;
-unsigned long testModeStartTime = 0;
-const unsigned long TEST_DURATION = 5000;
+unsigned long lastPIDTime = 0, lastRPMTime = 0, lastIMUTime = 0;
 
 // Delta ticks
 long lastSentTicks1 = 0,lastSentTicks2 = 0,lastSentTicks3 = 0;
 
 // === FUNCTION DECLARATIONS ===
-void parseAndDrive(String data);
 void calculateRPM();
 void applyFilter();
 void updateRampTargets();
 void updatePID();
 void setMotorPWM(int id, int pwm);
-void printStatus();
 void forceStopMotors();
 float computeFeedforward(float targetRPM);
 int rateLimitPWM(int newPWM, int* lastPWM);
 bool isNearZero(float value);
-float applyDeadZone(float rpm);
 void sendFeedbackPacket();
 void handleBinaryProtocol();
-void handleDebugMode();
 void updateIMU();
 
 void setup() {
@@ -169,7 +161,7 @@ void setup() {
 
     // === IMU SETUP (with timeout to prevent blocking) ===
     Wire.begin(SDA, SCL);
-    Wire.setClock(400000);  // 100kHz I2C (slower = more stable)
+    Wire.setClock(400000);
     
     if (!mpu.begin(0x68, &Wire)) {
         imuReady = false;
@@ -182,31 +174,18 @@ void setup() {
 
         delay(100);
     }
-
-    // Binary mode: NO text output (akan corrupt binary stream)
-    // Untuk debug, ketik 'd' di Serial Monitor untuk switch ke debug mod
-    // Only print welcome if NOT in binary mode
-    if (!binaryMode) {
-        Serial.println();
-        Serial.println("=== ESP32 MOTOR CONTROLLER ===");
-        Serial.print("IMU Status: ");
-        Serial.println(imuReady ? "READY" : "NOT READY");
-        Serial.println("Mode: Debug (ketik 'b' untuk binary mode)");
-    }
+    
+    // Binary mode only - no debug output
 }
 
 void loop() {
     static unsigned long lastModeBlink = 0;
-    if (millis() - lastModeBlink > (binaryMode ? 1000 : 200)) {
+    if (millis() - lastModeBlink > 1000) {
         digitalWrite(LED_PIN, !digitalRead(LED_PIN));
         lastModeBlink = millis();
     }
 
-    if (binaryMode) {
-        handleBinaryProtocol();
-    } else {
-        handleDebugMode();
-    }
+    handleBinaryProtocol();
 
     if (millis() - lastRPMTime >= RPM_INTERVAL) {
         calculateRPM();
@@ -217,7 +196,7 @@ void loop() {
     if (millis() - lastPIDTime >= PID_INTERVAL) {
         updateRampTargets();
         
-        if (binaryMode && !protocol.isCommHealthy()) {
+        if (!protocol.isCommHealthy()) {
             // Motors already stopped by watchdog callback
         } else {
             updatePID();
@@ -230,34 +209,13 @@ void loop() {
         lastIMUTime = millis();
     }
 
-    if (binaryMode && millis() - lastFeedbackTime >= FEEDBACK_INTERVAL) {
+    if (millis() - lastFeedbackTime >= FEEDBACK_INTERVAL) {
         sendFeedbackPacket();
         lastFeedbackTime = millis();
-    }
-
-    if (!binaryMode && millis() - lastPrintTime >= PRINT_INTERVAL) {
-        printStatus();
-        lastPrintTime = millis();
     }
 }
 
 void handleBinaryProtocol() {
-    // Check for debug mode switch ('d' or 'D' character)
-    while (Serial.available() > 0) {
-        uint8_t byte = Serial.peek();
-        
-        // If it's 'd' or 'D', switch to debug mode
-        if (byte == 'd' || byte == 'D') {
-            Serial.read();  // Consume the byte
-            binaryMode = false;
-            forceStopMotors();
-            Serial.println(">>> DEBUG MODE <<<");
-            Serial.println("Commands: w=test, r=reset, s=stop, b=binary");
-            return;
-        }
-        break;  // Not a mode switch, let parseCommand handle it
-    }
-    
     CommandPacket cmd = protocol.parseCommand();
     
     if (cmd.valid) {
@@ -325,85 +283,6 @@ void updateIMU() {
 
     lastGoodGyroZ = (int16_t)(filteredGyroZ * 1000);
     lastGoodAccelZ = (int16_t)(filteredAngleX * 1000);
-}
-
-void handleDebugMode() {
-    if (testModeActive && (millis() - testModeStartTime >= TEST_DURATION)) {
-        testModeActive = false;
-        targetRPM1 = targetRPM2 = targetRPM3 = 0;
-        Serial.println(">>> TEST SELESAI <<<");
-    }
-
-    if (Serial.available() > 0) {
-        String data = "";
-        while (Serial.available() > 0) {
-            data = Serial.readStringUntil('\n');
-            data.trim();
-        }
-        
-        digitalWrite(LED_PIN, HIGH);
-        
-        if (data == "b" || data == "B") {
-            binaryMode = true;
-            protocol.resetWatchdog();
-            // No print - akan corrupt binary stream
-        }
-        else if (data == "d" || data == "D") {
-            binaryMode = false;
-            Serial.println(">>> DEBUG MODE <<<");
-            Serial.println("Commands: w=test, r=reset, s=stop, b=binary");
-        }
-        else if (data == "r" || data == "R") {
-            encoder1.clearCount(); encoder2.clearCount(); encoder3.clearCount();
-            pid1.reset(); pid2.reset(); pid3.reset();
-            prevTicks1 = prevTicks2 = prevTicks3 = 0;
-            testModeActive = false;
-            forceStopMotors();
-            Serial.println(">>> RESET <<<");
-        } 
-        else if (data == "s" || data == "S") {
-            testModeActive = false;
-            forceStopMotors();
-            Serial.println(">>> STOP <<<");
-        }
-        else if (data == "w" || data == "W") {
-            targetRPM1 = targetRPM2 = targetRPM3 = 300;
-            testModeActive = true;
-            testModeStartTime = millis();
-            Serial.println(">>> TEST 300 RPM <<<");
-        }
-        else if (data.length() > 0) {
-            parseAndDrive(data);
-        }
-        
-        digitalWrite(LED_PIN, LOW);
-    }
-}
-
-void parseAndDrive(String data) {
-    int comma1 = data.indexOf(',');
-    int comma2 = data.indexOf(',', comma1 + 1);
-
-    if (comma1 > 0 && comma2 > 0) {
-        float newRPM1 = applyDeadZone(data.substring(0, comma1).toFloat());
-        float newRPM2 = applyDeadZone(data.substring(comma1 + 1, comma2).toFloat());
-        float newRPM3 = applyDeadZone(data.substring(comma2 + 1).toFloat());
-
-        bool changed = (abs(newRPM1 - targetRPM1) > 1.0) || 
-                       (abs(newRPM2 - targetRPM2) > 1.0) || 
-                       (abs(newRPM3 - targetRPM3) > 1.0);
-
-        targetRPM1 = newRPM1;
-        targetRPM2 = newRPM2;
-        targetRPM3 = newRPM3;
-
-        if (changed) {
-            Serial.print("TARGET: ");
-            Serial.print(targetRPM1); Serial.print(",");
-            Serial.print(targetRPM2); Serial.print(",");
-            Serial.println(targetRPM3);
-        }
-    }
 }
 
 void calculateRPM() {
@@ -517,29 +396,6 @@ void setMotorPWM(int id, int pwm) {
     else { analogWrite(r_pin, 0); analogWrite(l_pin, 0); }
 }
 
-void printStatus() {
-    Serial.print("RAW: ");
-    Serial.print(rawRPM1, 1); Serial.print(",");
-    Serial.print(rawRPM2, 1); Serial.print(",");
-    Serial.print(rawRPM3, 1);
-    
-    Serial.print(" | PWM: ");
-    Serial.print(lastPWM1); Serial.print(",");
-    Serial.print(lastPWM2); Serial.print(",");
-    Serial.print(lastPWM3);
-
-    Serial.print(" | TGT: ");
-    Serial.print(actualTarget1, 1); Serial.print(",");
-    Serial.print(actualTarget2, 1); Serial.print(",");
-    Serial.print(actualTarget3, 1);
-    
-    if (isNearZero(actualTarget1) && isNearZero(actualTarget2) && isNearZero(actualTarget3)) {
-        Serial.println(" [STOP]");
-    } else {
-        Serial.println();
-    }
-}
-
 float computeFeedforward(float targetRPM) {
     if (abs(targetRPM) < FF_DEADBAND) return 0.0;
     float pwm = FF_OFFSET + FF_SLOPE * abs(targetRPM);
@@ -549,10 +405,6 @@ float computeFeedforward(float targetRPM) {
 
 bool isNearZero(float value) {
     return (abs(value) < ZERO_THRESHOLD);
-}
-
-float applyDeadZone(float rpm) {
-    return (abs(rpm) < DEAD_ZONE_RPM) ? 0.0 : rpm;
 }
 
 void updateRampTargets() {
