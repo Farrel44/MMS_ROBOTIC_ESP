@@ -77,14 +77,14 @@ const float FF_OFFSET = 5.0;
 const float FF_DEADBAND = 3.0;
 
 // === TIMING ===
-const int PID_INTERVAL = 20;
-const int RPM_INTERVAL = 20;  // SYNCHRONIZED with PID for consistent derivative calculation
-const int IMU_INTERVAL = 20;   // Separate IMU sampling rate
+const int PID_INTERVAL = 10;
+const int RPM_INTERVAL = 10;  // SYNCHRONIZED with PID for consistent derivative calculation
+const int IMU_INTERVAL = 10;   // Separate IMU sampling rate
 const int PRINT_INTERVAL = 200;
 
 // === RATE LIMITER (prevents PWM jerk) ===
 int lastPWM1 = 0, lastPWM2 = 0, lastPWM3 = 0;
-const int PWM_RATE_LIMIT = 5;
+const int PWM_RATE_LIMIT = 3;
 
 // === RAMP SYSTEM ===
 const float RAMP_UP_RATE = 5.0;
@@ -299,7 +299,7 @@ void calculateRPM() {
     float deltaT = (currentMicros - prevMicros) / 1000000.0;
     prevMicros = currentMicros;
 
-    if (deltaT <= 0.01 || deltaT > 0.5) {
+    if (deltaT <= 0.005 || deltaT > 0.5) {
         prevTicks1 = encoder1.getCount();
         prevTicks2 = encoder2.getCount();
         prevTicks3 = encoder3.getCount();
