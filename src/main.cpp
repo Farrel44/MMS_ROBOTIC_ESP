@@ -62,9 +62,9 @@ const bool INVERT_PWM3 = false;
 
 // === PID (Feedforward + Trim architecture) ===
 // untuk Ki di half dari matlab karena ada feedforward
-PIDController pid1(0.40, 4.60, 0);
-PIDController pid2(0.40, 4.60, 0);
-PIDController pid3(0.40, 4.60, 0);
+PIDController pid1(0.40, 4.60, 0.05);
+PIDController pid2(0.40, 4.60, 0.05);
+PIDController pid3(0.40, 4.60, 0.05);
 
 // === CONSTANTS ===
 const int TICKS_PER_REV = 380;
@@ -143,9 +143,9 @@ void setup() {
     pid1.setOutputLimits(-MAX_PWM, MAX_PWM);
     pid2.setOutputLimits(-MAX_PWM, MAX_PWM);
     pid3.setOutputLimits(-MAX_PWM, MAX_PWM);
-    pid1.setIntegralLimits(10);
-    pid2.setIntegralLimits(10);
-    pid3.setIntegralLimits(10);
+    pid1.setIntegralLimits(50);
+    pid2.setIntegralLimits(50);
+    pid3.setIntegralLimits(50);
 
     digitalWrite(M1_EN, HIGH);
     digitalWrite(M2_EN, HIGH);
