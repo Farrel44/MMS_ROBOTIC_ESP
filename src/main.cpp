@@ -53,8 +53,10 @@ unsigned long lastFeedbackTime = 0;
 const int FEEDBACK_INTERVAL = 20;
 
 // === DIRECTION CONFIG ===
-const bool INVERT_ENC1 = true;
-const bool INVERT_ENC2 = true;
+// Calibrate encoder polarity using a pure-rotation test (vx=0, vy=0):
+// all wheels are commanded the same sign, so all encoder deltas must have the same sign.
+const bool INVERT_ENC1 = false;
+const bool INVERT_ENC2 = false;
 const bool INVERT_ENC3 = true;
 const bool INVERT_PWM1 = false;
 const bool INVERT_PWM2 = false;
@@ -353,17 +355,18 @@ void updatePID() {
     
     // PWM = Feedforward + PID trim (with rate limiting)
     float ff1 = computeFeedforward(actualTarget1);
-    float trim1 = pid1.compute(rawRPM1, actualTarget1);
+    // Use filtered RPM for smoother control response.
+    float trim1 = pid1.compute(currentRPM1, actualTarget1);
     int pwm1_raw = (int)constrain(ff1 + trim1, -MAX_PWM, MAX_PWM);
     int pwm1 = rateLimitPWM(pwm1_raw, &lastPWM1);
     
     float ff2 = computeFeedforward(actualTarget2);
-    float trim2 = pid2.compute(rawRPM2, actualTarget2);
+    float trim2 = pid2.compute(currentRPM2, actualTarget2);
     int pwm2_raw = (int)constrain(ff2 + trim2, -MAX_PWM, MAX_PWM);
     int pwm2 = rateLimitPWM(pwm2_raw, &lastPWM2);
     
     float ff3 = computeFeedforward(actualTarget3);
-    float trim3 = pid3.compute(rawRPM3, actualTarget3);
+    float trim3 = pid3.compute(currentRPM3, actualTarget3);
     int pwm3_raw = (int)constrain(ff3 + trim3, -MAX_PWM, MAX_PWM);
     int pwm3 = rateLimitPWM(pwm3_raw, &lastPWM3);
     
