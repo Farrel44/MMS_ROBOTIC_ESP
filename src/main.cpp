@@ -177,7 +177,6 @@ void setup() {
         delay(100);
     }
     
-    // Binary mode only - no debug output
 }
 
 void loop() {
