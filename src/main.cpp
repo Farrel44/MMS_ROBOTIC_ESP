@@ -33,14 +33,14 @@
 Adafruit_MPU6050 mpu;
 bool imuReady = false;
 int16_t lastGoodGyroZ = 0;
-int16_t lastGoodAccelZ = 981;
+int16_t lastGoodAccelZ = 0;
 uint8_t imuErrorCount = 0;
+const uint8_t IMU_ERROR_THRESHOLD = 10;  // Auto-disable IMU after consecutive failures
 
 // === COMPLEMENTARY FILTER STATE ===
 float filteredAngleX = 0.0;
-float filteredAngleY = 0.0;
 float filteredGyroZ = 0.0;
-const float FILTER_ALPHA = 0.95;  //Complementary filter constant (0.95)
+const float FILTER_ALPHA = 0.95;  // 95% gyro, 5% accel (optimal for flat surface)
 unsigned long lastFilterTime = 0;
 
 ESP32Encoder encoder1;
@@ -63,10 +63,11 @@ const bool INVERT_PWM2 = false;
 const bool INVERT_PWM3 = false;
 
 // === PID (Feedforward + Trim architecture) ===
-// untuk Ki di half dari matlab karena ada feedforward
-PIDController pid1(0.40, 4.60, 0.05);
-PIDController pid2(0.40, 4.60, 0.05);
-PIDController pid3(0.40, 4.60, 0.05);
+// Tuned for gear ratio 1:13.7 (low inertia, high responsiveness)
+// Ki reduced to prevent windup, Kd reduced to avoid noise amplification with EMA filter
+PIDController pid1(0.40, 3.60, 0.04);
+PIDController pid2(0.40, 3.60, 0.04);
+PIDController pid3(0.40, 3.60, 0.04);
 
 // === CONSTANTS ===
 const int TICKS_PER_REV = 380;
@@ -84,16 +85,17 @@ const int RPM_INTERVAL = 10;  // SYNCHRONIZED with PID for consistent derivative
 const int IMU_INTERVAL = 10;   // Separate IMU sampling rate
 const int PRINT_INTERVAL = 200;
 
-// === RATE LIMITER (prevents PWM jerk) ===
+// === RATE LIMITER ===
+// Conservative limit for gear 1:13.7 to prevent wheel slip
 int lastPWM1 = 0, lastPWM2 = 0, lastPWM3 = 0;
-const int PWM_RATE_LIMIT = 3;
+const int PWM_RATE_LIMIT = 4;  // Max delta PWM per 10ms
 
 // === RAMP SYSTEM ===
-const float RAMP_UP_RATE = 5.0;
-const float RAMP_DOWN_RATE = 3.0;
-const float DEAD_ZONE_RPM = 2.0;
-const float ZERO_THRESHOLD = 0.5;
-const float EMA_ALPHA = 0.4;
+const float RAMP_UP_RATE = 5.0;    // RPM per 10ms (0-40 RPM in 80ms)
+const float RAMP_DOWN_RATE = 8.0;  // Fast tracking for ROS ramp (critical fix!)
+const float DEAD_ZONE_RPM = 2.0;   // PID reset threshold
+const float ZERO_THRESHOLD = 0.3;  // Snap-to-zero threshold (smoother than 0.5)
+const float EMA_ALPHA = 0.30;      // Lower alpha for gear 1:13.7 noise reduction
 
 // === STATE VARIABLES ===
 float targetRPM1 = 0, targetRPM2 = 0, targetRPM3 = 0;
@@ -103,6 +105,16 @@ float currentRPM1 = 0, currentRPM2 = 0, currentRPM3 = 0;
 long prevTicks1 = 0, prevTicks2 = 0, prevTicks3 = 0;
 unsigned long prevMicros = 0;
 unsigned long lastPIDTime = 0, lastRPMTime = 0, lastIMUTime = 0;
+
+// === CACHED TIMING (reduce millis() overhead) ===
+struct {
+    unsigned long pid;
+    unsigned long rpm;
+    unsigned long imu;
+    unsigned long feedback;
+    unsigned long blink;
+    unsigned long now;
+} timing = {0, 0, 0, 0, 0, 0};
 
 // Delta ticks
 long lastSentTicks1 = 0,lastSentTicks2 = 0,lastSentTicks3 = 0;
@@ -180,39 +192,43 @@ void setup() {
 }
 
 void loop() {
-    static unsigned long lastModeBlink = 0;
-    if (millis() - lastModeBlink > 1000) {
+    // Cache millis() once per iteration to reduce overhead
+    timing.now = millis();
+    
+    // Heartbeat LED (1 Hz when idle)
+    if (timing.now - timing.blink > 1000) {
         digitalWrite(LED_PIN, !digitalRead(LED_PIN));
-        lastModeBlink = millis();
+        timing.blink = timing.now;
     }
 
     handleBinaryProtocol();
 
-    if (millis() - lastRPMTime >= RPM_INTERVAL) {
+    // RPM calculation and filtering (100 Hz)
+    if (timing.now - timing.rpm >= RPM_INTERVAL) {
         calculateRPM();
         applyFilter();
-        lastRPMTime = millis();
+        timing.rpm = timing.now;
     }
 
-    if (millis() - lastPIDTime >= PID_INTERVAL) {
+    // PID control loop (100 Hz)
+    if (timing.now - timing.pid >= PID_INTERVAL) {
         updateRampTargets();
-        
-        if (!protocol.isCommHealthy()) {
-            // Motors already stopped by watchdog callback
-        } else {
+        if (protocol.isCommHealthy()) {
             updatePID();
         }
-        lastPIDTime = millis();
+        timing.pid = timing.now;
     }
 
-    if (millis() - lastIMUTime >= IMU_INTERVAL){
+    // IMU update (100 Hz)
+    if (timing.now - timing.imu >= IMU_INTERVAL) {
         updateIMU();
-        lastIMUTime = millis();
+        timing.imu = timing.now;
     }
 
-    if (millis() - lastFeedbackTime >= FEEDBACK_INTERVAL) {
+    // Send feedback to RasPi (50 Hz)
+    if (timing.now - timing.feedback >= FEEDBACK_INTERVAL) {
         sendFeedbackPacket();
-        lastFeedbackTime = millis();
+        timing.feedback = timing.now;
     }
 }
 
@@ -225,15 +241,16 @@ void handleBinaryProtocol() {
         targetRPM3 = constrain(cmd.rpm3, -MAX_RPM, MAX_RPM);
         
         digitalWrite(LED_PIN, HIGH);
-        delayMicroseconds(100);
+        delayMicroseconds(50);
         digitalWrite(LED_PIN, LOW);
     }
     
+    // Watchdog fast blink (10 Hz when comm lost)
     if (protocol.checkWatchdog()) {
         static unsigned long lastBlink = 0;
-        if (millis() - lastBlink > 100) {
+        if (timing.now - lastBlink > 100) {
             digitalWrite(LED_PIN, !digitalRead(LED_PIN));
-            lastBlink = millis();
+            lastBlink = timing.now;
         }
     }
 }
@@ -260,30 +277,41 @@ void sendFeedbackPacket() {
 }
 
 void updateIMU() {
-    if(!imuReady){
-        return;
-    }
+    if (!imuReady) return;
 
     sensors_event_t a, g, temp;
-    mpu.getEvent(&a, &g, &temp);
+    
+    // Error handling: auto-disable IMU after repeated failures
+    if (!mpu.getEvent(&a, &g, &temp)) {
+        imuErrorCount++;
+        if (imuErrorCount > IMU_ERROR_THRESHOLD) {
+            imuReady = false;
+        }
+        return;
+    }
+    imuErrorCount = 0;
 
     unsigned long currentTime = micros();
     float dt = (lastFilterTime == 0) ? 0.02 : (currentTime - lastFilterTime) / 1000000.0;
     lastFilterTime = currentTime;
 
-    if(dt < 0.001 || dt > 0.1) {
-        dt = 0.02;
-    }
+    if (dt < 0.001 || dt > 0.1) dt = 0.02;
 
-    float accelAngleX = atan2(a.acceleration.y, sqrt(a.acceleration.x * a.acceleration.x + a.acceleration.z * a.acceleration.z));
-    float accelAngleY = atan2(-a.acceleration.x, sqrt(a.acceleration.y * a.acceleration.y + a.acceleration.z * a.acceleration.z));
+    // Calculate pitch angle from accelerometer (optimized: pre-compute squares)
+    float ax2 = a.acceleration.x * a.acceleration.x;
+    float az2 = a.acceleration.z * a.acceleration.z;
+    float accelAngleX = atan2(a.acceleration.y, sqrt(ax2 + az2));
 
-    filteredAngleX = FILTER_ALPHA * (filteredAngleX + g.gyro.x * dt) + (1.0 - FILTER_ALPHA) * accelAngleX;
-    filteredAngleY = FILTER_ALPHA * (filteredAngleY + g.gyro.y * dt) + (1.0 - FILTER_ALPHA) * accelAngleY;
+    // Complementary filter: 95% gyro integration + 5% accel correction
+    filteredAngleX = FILTER_ALPHA * (filteredAngleX + g.gyro.x * dt) 
+                   + (1.0 - FILTER_ALPHA) * accelAngleX;
+    
+    // Low-pass filter for yaw rate
     filteredGyroZ = FILTER_ALPHA * filteredGyroZ + (1.0 - FILTER_ALPHA) * g.gyro.z;
 
-    lastGoodGyroZ = (int16_t)(filteredGyroZ * 1000);
-    lastGoodAccelZ = (int16_t)(filteredAngleX * 1000);
+    // Scale for transmission (×1000 for int16 precision)
+    lastGoodGyroZ = (int16_t)(filteredGyroZ * 1000.0);
+    lastGoodAccelZ = (int16_t)(filteredAngleX * 1000.0);
 }
 
 void calculateRPM() {
@@ -340,6 +368,7 @@ void updatePID() {
     bool allZero = isNearZero(actualTarget1) && isNearZero(actualTarget2) && isNearZero(actualTarget3);
     
     if (allZero) {
+        // Full stop: zero PWM and reset PID state
         setMotorPWM(1, 0);
         setMotorPWM(2, 0);
         setMotorPWM(3, 0);
@@ -348,9 +377,10 @@ void updatePID() {
         return;
     }
     
-    if (abs(actualTarget1) < 1.0) pid1.reset();
-    if (abs(actualTarget2) < 1.0) pid2.reset();
-    if (abs(actualTarget3) < 1.0) pid3.reset();
+    // Reset PID in dead zone to prevent integral buildup at low speeds
+    if (abs(actualTarget1) < DEAD_ZONE_RPM) pid1.reset();
+    if (abs(actualTarget2) < DEAD_ZONE_RPM) pid2.reset();
+    if (abs(actualTarget3) < DEAD_ZONE_RPM) pid3.reset();
     
     // PWM = Feedforward + PID trim (with rate limiting)
     float ff1 = computeFeedforward(actualTarget1);
@@ -410,18 +440,28 @@ bool isNearZero(float value) {
 }
 
 void updateRampTargets() {
-    // Motor 1
+    // Motor 1: Smooth acceleration/deceleration
     if (actualTarget1 < targetRPM1) {
+        // Ramp up
         actualTarget1 += RAMP_UP_RATE;
         if (actualTarget1 > targetRPM1) actualTarget1 = targetRPM1;
     } else if (actualTarget1 > targetRPM1) {
+        // Ramp down
         actualTarget1 -= RAMP_DOWN_RATE;
         if (actualTarget1 < targetRPM1) actualTarget1 = targetRPM1;
     }
-    // Snap to 0 if very small (prevents floating point residue)
-    if (targetRPM1 == 0 && abs(actualTarget1) < RAMP_DOWN_RATE) actualTarget1 = 0;
     
-    // Motor 2
+    // CRITICAL FIX: Snap to target on sign change (prevent direction conflict)
+    if ((actualTarget1 > 0 && targetRPM1 < 0) || (actualTarget1 < 0 && targetRPM1 > 0)) {
+        actualTarget1 = targetRPM1;
+    }
+    
+    // Snap to zero if very close (prevents float residue)
+    if (targetRPM1 == 0 && abs(actualTarget1) < ZERO_THRESHOLD) {
+        actualTarget1 = 0;
+    }
+    
+    // Motor 2: Same logic
     if (actualTarget2 < targetRPM2) {
         actualTarget2 += RAMP_UP_RATE;
         if (actualTarget2 > targetRPM2) actualTarget2 = targetRPM2;
@@ -429,9 +469,14 @@ void updateRampTargets() {
         actualTarget2 -= RAMP_DOWN_RATE;
         if (actualTarget2 < targetRPM2) actualTarget2 = targetRPM2;
     }
-    if (targetRPM2 == 0 && abs(actualTarget2) < RAMP_DOWN_RATE) actualTarget2 = 0;
+    if ((actualTarget2 > 0 && targetRPM2 < 0) || (actualTarget2 < 0 && targetRPM2 > 0)) {
+        actualTarget2 = targetRPM2;
+    }
+    if (targetRPM2 == 0 && abs(actualTarget2) < ZERO_THRESHOLD) {
+        actualTarget2 = 0;
+    }
     
-    // Motor 3
+    // Motor 3: Same logic
     if (actualTarget3 < targetRPM3) {
         actualTarget3 += RAMP_UP_RATE;
         if (actualTarget3 > targetRPM3) actualTarget3 = targetRPM3;
@@ -439,7 +484,12 @@ void updateRampTargets() {
         actualTarget3 -= RAMP_DOWN_RATE;
         if (actualTarget3 < targetRPM3) actualTarget3 = targetRPM3;
     }
-    if (targetRPM3 == 0 && abs(actualTarget3) < RAMP_DOWN_RATE) actualTarget3 = 0;
+    if ((actualTarget3 > 0 && targetRPM3 < 0) || (actualTarget3 < 0 && targetRPM3 > 0)) {
+        actualTarget3 = targetRPM3;
+    }
+    if (targetRPM3 == 0 && abs(actualTarget3) < ZERO_THRESHOLD) {
+        actualTarget3 = 0;
+    }
 }
 
 void forceStopMotors() {
