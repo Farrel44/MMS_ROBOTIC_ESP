@@ -3,7 +3,13 @@
 
 #include <Arduino.h>
 
-//header untuk memanggil fungsi dari pid.cpp
+/**
+ * PID Controller with anti-windup and output clamping
+ * Features:
+ * - Independent dt calculation (micros-based)
+ * - Configurable integral limits (prevents windup)
+ * - Output saturation limits
+ */
 class PIDController {
 private:
     float Kp;
