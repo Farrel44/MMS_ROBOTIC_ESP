@@ -27,7 +27,7 @@ volatile bool pidFlag = false;
 
 // === PIN MOTOR ===
 #define M1_RPWM 14
-#define M1_LPWM 12 
+#define M1_LPWM 23 
 #define M1_EN 13 
 #define M2_RPWM 19
 #define M2_LPWM 15
